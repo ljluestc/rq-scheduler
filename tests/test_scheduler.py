@@ -547,14 +547,16 @@ class TestScheduler(RQTestCase):
         # Create a job with a cronjob_string
         now = datetime.now(UTC).replace(minute=0, hour=0, second=0, microsecond=0)
         with freezegun.freeze_time(now):
-            # Patch the datetime class in scheduler module to use the frozen datetime
-            with mock.patch('rq_scheduler.scheduler.datetime', datetime):
+            # Patch the datetime class in scheduler and utils modules to use the frozen datetime
+            with mock.patch('rq_scheduler.scheduler.datetime', datetime), \
+                 mock.patch('rq_scheduler.utils.datetime', datetime):
                 job = self.scheduler.cron("5 * * * * *", say_hello)
 
                 with mock.patch.object(self.scheduler, 'enqueue_job', wraps=self.scheduler.enqueue_job) as enqueue_job, \
                         freezegun.freeze_time(now + timedelta(minutes=5)):
-                    # Patch it again for the second freeze_time block (as it returns a new FakeDatetime)
-                    with mock.patch('rq_scheduler.scheduler.datetime', datetime):
+                    # Patch it again for the second freeze_time block
+                    with mock.patch('rq_scheduler.scheduler.datetime', datetime), \
+                         mock.patch('rq_scheduler.utils.datetime', datetime):
                         self.assertEqual(1, self.scheduler.count())
                         self.scheduler.enqueue_jobs()
                         self.assertEqual(1, enqueue_job.call_count)
