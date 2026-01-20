@@ -19,7 +19,7 @@ When a job with a fixed ID is running and tries to schedule itself again using `
 ## Verification
 - **Reproduction**: A reproduction script `reproduce_issue.py` was created to simulate the recursive scheduling scenario. Before the fix, the job would stop repeating after a few iterations. After the fix, it runs indefinitely as expected.
 - **Unit Tests**:
-  - `tests/test_fix.py` was added (and then verified) to ensure `enqueue_in` does not overwrite `STARTED` or `QUEUED` status.
+  - `tests/test_scheduler.py` was updated with regression tests (`TestSchedulerRaceCondition`) to ensure `enqueue_in` does not overwrite `STARTED` or `QUEUED` status.
   - Existing tests in `tests/test_scheduler.py` and `tests/test_callbacks.py` were updated to fix regressions related to test assumptions about private attributes and timezone handling.
   - Full test suite passed.
 

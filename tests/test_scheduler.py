@@ -10,7 +10,7 @@ import freezegun
 from dateutil.tz import tzlocal
 from dateutil.tz import UTC
 from rq import Queue
-from rq.job import Job
+from rq.job import Job, JobStatus
 
 from rq_scheduler import Scheduler
 from rq_scheduler.utils import from_unix
@@ -545,19 +545,23 @@ class TestScheduler(RQTestCase):
 
     def test_crontab_schedules_correctly(self):
         # Create a job with a cronjob_string
-        now = datetime.now().replace(minute=0, hour=0, second=0, microsecond=0)
+        now = datetime.now(UTC).replace(minute=0, hour=0, second=0, microsecond=0)
         with freezegun.freeze_time(now):
-            job = self.scheduler.cron("5 * * * * *", say_hello)
+            # Patch the datetime class in scheduler module to use the frozen datetime
+            with mock.patch('rq_scheduler.scheduler.datetime', datetime):
+                job = self.scheduler.cron("5 * * * * *", say_hello)
 
-        with mock.patch.object(self.scheduler, 'enqueue_job', wraps=self.scheduler.enqueue_job) as enqueue_job, \
-                freezegun.freeze_time(now + timedelta(minutes=5)):
-            self.assertEqual(1, self.scheduler.count())
-            self.scheduler.enqueue_jobs()
-            self.assertEqual(1, enqueue_job.call_count)
+                with mock.patch.object(self.scheduler, 'enqueue_job', wraps=self.scheduler.enqueue_job) as enqueue_job, \
+                        freezegun.freeze_time(now + timedelta(minutes=5)):
+                    # Patch it again for the second freeze_time block (as it returns a new FakeDatetime)
+                    with mock.patch('rq_scheduler.scheduler.datetime', datetime):
+                        self.assertEqual(1, self.scheduler.count())
+                        self.scheduler.enqueue_jobs()
+                        self.assertEqual(1, enqueue_job.call_count)
 
-            (job, next_scheduled_time), = self.scheduler.get_jobs(with_times=True)
-            expected_scheduled_time = (now + timedelta(hours=1, minutes=5)).astimezone(UTC)
-            self.assertEqual(to_unix(expected_scheduled_time), to_unix(next_scheduled_time))
+                        (job, next_scheduled_time), = self.scheduler.get_jobs(with_times=True)
+                        expected_scheduled_time = (now + timedelta(hours=1, minutes=5)).astimezone(UTC)
+                        self.assertEqual(to_unix(expected_scheduled_time), to_unix(next_scheduled_time))
 
     def test_crontab_sets_timeout(self):
         """
@@ -874,3 +878,72 @@ class TestScheduler(RQTestCase):
         job = self.scheduler._create_job(say_hello)
         job_from_queue = Job.fetch(job.id, connection=self.testconn)
         self.assertFalse(job_from_queue.meta.get("queue_class_name"))
+
+
+class TestSchedulerRaceCondition(RQTestCase):
+    def setUp(self):
+        super(TestSchedulerRaceCondition, self).setUp()
+        self.scheduler = Scheduler(connection=self.testconn)
+        self.job_id = 'race_condition_job'
+
+    def test_enqueue_in_does_not_overwrite_started_status(self):
+        """
+        Verify that calling enqueue_in on a job that is currently STARTED
+        does not overwrite its status to SCHEDULED.
+        """
+        # Create a job and simulate it being STARTED (as if running)
+        job = Job.create(func=lambda: None, id=self.job_id, connection=self.testconn)
+        job.save()
+        job.set_status(JobStatus.STARTED)
+        
+        # Verify initial state
+        job.refresh()
+        self.assertEqual(job.get_status(), JobStatus.STARTED)
+        
+        # Schedule the same job again (simulating recursive enqueue_in from within the job)
+        self.scheduler.enqueue_in(timedelta(minutes=1), lambda: None, job_id=self.job_id)
+        
+        # Verify that the job is in the scheduled registry (ZSET)
+        self.assertIn(self.job_id, self.scheduler)
+        
+        # CRITICAL CHECK: Status should still be STARTED, NOT SCHEDULED
+        job.refresh()
+        self.assertEqual(job.get_status(), JobStatus.STARTED, 
+                         "enqueue_in should not overwrite STARTED status with SCHEDULED")
+
+    def test_enqueue_in_does_not_overwrite_queued_status(self):
+        """
+        Verify that calling enqueue_in on a job that is currently QUEUED
+        does not overwrite its status to SCHEDULED.
+        """
+        # Create a job and simulate it being QUEUED
+        job = Job.create(func=lambda: None, id=self.job_id, connection=self.testconn)
+        job.save()
+        job.set_status(JobStatus.QUEUED)
+        
+        # Schedule the same job again
+        self.scheduler.enqueue_in(timedelta(minutes=1), lambda: None, job_id=self.job_id)
+        
+        # Verify ZSET
+        self.assertIn(self.job_id, self.scheduler)
+        
+        # CRITICAL CHECK
+        job.refresh()
+        self.assertEqual(job.get_status(), JobStatus.QUEUED,
+                         "enqueue_in should not overwrite QUEUED status with SCHEDULED")
+
+    def test_enqueue_in_updates_scheduled_status(self):
+        """
+        Verify that normal scheduling works (updates status if it was e.g. FINISHED or new)
+        """
+        # Case 1: New Job
+        new_id = 'new_job'
+        self.scheduler.enqueue_in(timedelta(minutes=1), lambda: None, job_id=new_id)
+        job = Job.fetch(new_id, connection=self.testconn)
+        self.assertEqual(job.get_status(), JobStatus.SCHEDULED)
+        
+        # Case 2: Finished Job
+        job.set_status(JobStatus.FINISHED)
+        self.scheduler.enqueue_in(timedelta(minutes=1), lambda: None, job_id=new_id)
+        job.refresh()
+        self.assertEqual(job.get_status(), JobStatus.SCHEDULED)

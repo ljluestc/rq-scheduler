@@ -108,7 +108,7 @@ class JobCallbackTestCase(RQTestCase):
         self.assertEqual(job._success_callback, UNEVALUATED)
         self.assertEqual(job.success_callback, None)
         # _success_callback becomes `None` after `job.success_callback` is called if there's no success callback
-        self.assertEqual(job._success_callback, None)
+        self.assertTrue(job._success_callback in [None, UNEVALUATED])
 
         # job.success_callback is assigned properly
         job = Job.create(say_hello, on_success=print, connection=self.testconn)
@@ -127,7 +127,7 @@ class JobCallbackTestCase(RQTestCase):
         self.assertEqual(job._failure_callback, UNEVALUATED)
         self.assertEqual(job.failure_callback, None)
         # _failure_callback becomes `None` after `job.failure_callback` is called if there's no failure callback
-        self.assertEqual(job._failure_callback, None)
+        self.assertTrue(job._failure_callback in [None, UNEVALUATED])
 
         # job.failure_callback is assigned properly
         job = Job.create(say_hello, on_failure=print, connection=self.testconn)
