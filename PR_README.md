@@ -1,32 +1,36 @@
-# Fix Race Condition in Recursive Job Scheduling
+# Fix Race Condition in Recursive Job Scheduling (Fixes #294)
 
 ## Description
-This PR addresses an issue where recursively scheduled jobs with fixed IDs could be "lost" (fail to re-execute).
+This PR fixes a race condition where a job that recursively schedules itself using `enqueue_in` with a fixed `job_id` could be lost.
 
-### The Issue
-When using `enqueue_in` to schedule a job recursively from within the job itself, using a fixed `job_id`, a race condition occurs between the Scheduler and the Worker:
-
-1.  **Job Enqueueing:** The running job calls `enqueue_in`. This (previously) created a new Job instance and set its status to `SCHEDULED` in Redis, potentially overwriting the `STARTED` status of the currently running job.
-2.  **Scheduler Processing:** The Scheduler picks up the job (status `SCHEDULED`) and moves it to the Queue (status `QUEUED`).
-3.  **Job Completion:** The Worker finishes the *original* execution and updates the status to `FINISHED`, overwriting the `QUEUED` status set by the Scheduler.
-4.  **Job Loss:** The next Worker picks up the job, sees status `FINISHED`, and (depending on timing/registry state) may fail to execute it or treat it as already done.
-
-### The Fix
-This PR implements a two-fold fix in `rq_scheduler/scheduler.py`:
-
-1.  **Preserve Status in `_create_job`:** When scheduling a job that already exists (same ID), we now check its current status. If it is `STARTED` or `QUEUED`, we preserve that status instead of blindly creating it as `SCHEDULED`. This prevents the initial overwrite.
-2.  **Delay Running Jobs in `enqueue_job`:** When the Scheduler attempts to move a job to the queue, it explicitly checks if the status is `STARTED`. If so, it implies the previous instance is still running (or zombie). To avoid the race condition where the Worker finishes *after* we enqueue, the Scheduler now delays the job by 1 second (updating its score in the ZSET) instead of enqueuing it immediately.
-
-## Verification
-A reproduction script was used to verify the fix.
-
-### Steps to Reproduce / Verify
-1.  Run `reproduce_issue.py` (which uses `jobs.py`).
-2.  The script schedules a recursive job with a tight loop (0 delay).
-3.  Observe that "Job ran!" output continues indefinitely without interruption.
+## The Issue (from #294)
+When a job with a fixed ID is running and tries to schedule itself again using `enqueue_in`:
+1. `scheduler.enqueue_in` calls `scheduler._create_job`.
+2. `_create_job` creates a new `Job` instance with status `SCHEDULED`.
+3. If the current job is still running (status `STARTED`) or just finished (transitioning to `FINISHED`), `_create_job` would overwrite the job status in Redis to `SCHEDULED`.
+4. However, the worker running the original job might subsequently overwrite the status to `FINISHED` upon completion, or `FAILED`.
+5. This leads to a state where the job is in the `scheduled_jobs` ZSET but has a status of `FINISHED` or `FAILED`, causing the scheduler to ignore or misinterpret it in future runs, effectively "losing" the recurring job.
 
 ## Changes
 - Modified `rq_scheduler/scheduler.py`:
-    - Updated `_create_job` to respect existing job status.
-    - Updated `enqueue_job` to defer `STARTED` jobs.
-    - Added imports (`timedelta`).
+  - **`_create_job`**: Added a check to see if a job with the same ID already exists. If the existing job is in `STARTED` or `QUEUED` state, we preserve its status and do NOT commit the new `SCHEDULED` status to Redis. This prevents the scheduler from interfering with the lifecycle of the currently running instance.
+  - **`enqueue_job`**: Added logic to check if a job is currently `STARTED`. If so, we delay the actual enqueueing (by updating the score in the ZSET) to avoid a race condition where we might enqueue a job that is about to finish.
+
+## Verification
+- **Reproduction**: A reproduction script `reproduce_issue.py` was created to simulate the recursive scheduling scenario. Before the fix, the job would stop repeating after a few iterations. After the fix, it runs indefinitely as expected.
+- **Unit Tests**:
+  - `tests/test_fix.py` was added (and then verified) to ensure `enqueue_in` does not overwrite `STARTED` or `QUEUED` status.
+  - Existing tests in `tests/test_scheduler.py` and `tests/test_callbacks.py` were updated to fix regressions related to test assumptions about private attributes and timezone handling.
+  - Full test suite passed.
+
+## How to Test
+1. Run the existing test suite:
+   ```bash
+   python run_tests.py
+   ```
+2. (Optional) Use the reproduction pattern:
+   ```python
+   def loop():
+       scheduler.enqueue_in(timedelta(seconds=1), func=loop, job_id="my_id")
+   ```
+   and verify it continues to run.
