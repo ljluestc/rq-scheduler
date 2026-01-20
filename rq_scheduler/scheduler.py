@@ -5,7 +5,7 @@ import os
 import socket
 from uuid import uuid4
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import repeat
 
 from rq.exceptions import NoSuchJobError
@@ -140,12 +140,22 @@ class Scheduler(object):
             args = ()
         if kwargs is None:
             kwargs = {}
+        status = JobStatus.SCHEDULED
+        if id:
+            try:
+                existing_job = self.job_class.fetch(id, connection=self.connection)
+                existing_status = existing_job.get_status()
+                if existing_status in [JobStatus.STARTED, JobStatus.QUEUED]:
+                    status = existing_status
+            except NoSuchJobError:
+                pass
+
         job = self.job_class.create(
             func, args=args, connection=self.connection,
             kwargs=kwargs, result_ttl=result_ttl, ttl=ttl, id=id,
             description=description, timeout=timeout, meta=meta,
             depends_on=depends_on, on_success=on_success, on_failure=on_failure,
-            status=JobStatus.SCHEDULED
+            status=status
         )
         if queue_name:
             job.origin = queue_name
@@ -411,6 +421,11 @@ class Scheduler(object):
         back into the scheduler if needed.
         """
         self.log.debug('Pushing {0}({1}) to {2}'.format(job.func_name, job.id, job.origin))
+
+        if job.get_status() == JobStatus.STARTED:
+            self.log.warning('Job %s is currently running. Delaying scheduling to avoid race.', job.id)
+            self.connection.zadd(self.scheduled_jobs_key, {job.id: to_unix(datetime.utcnow() + timedelta(seconds=1))})
+            return
 
         interval = job.meta.get('interval', None)
         repeat = job.meta.get('repeat', None)
